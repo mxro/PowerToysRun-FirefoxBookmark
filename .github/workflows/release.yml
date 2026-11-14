@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content ./FirefoxBookmark/plugin.json -Raw | ConvertFrom-Json).Version
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=v$version" >> $env:GITHUB_OUTPUT
+
+      - name: Check if release exists
+        id: check
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release view "$env:TAG" --repo "$env:GITHUB_REPOSITORY" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            "exists=true" >> $env:GITHUB_OUTPUT
+            Write-Host "Release $env:TAG already exists; skipping publish."
+          } else {
+            "exists=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Setup .NET
+        if: steps.check.outputs.exists == 'false'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Build and package
+        if: steps.check.outputs.exists == 'false'
+        shell: pwsh
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          $name = 'FirefoxBookmark'
+          $assembly = "Community.PowerToys.Run.Plugin.$name"
+          $tag = $env:TAG
+          $archs = @('x64', 'arm64')
+          $outDir = './out'
+          $tempDir = "$outDir/$name"
+
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          foreach ($arch in $archs) {
+            dotnet build ./FirefoxBookmark/FirefoxBookmark.csproj -c Release /p:Platform=$arch
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+
+            $releasePath = "./FirefoxBookmark/bin/$arch/Release/net9.0-windows"
+            Remove-Item $tempDir -Recurse -Force -ErrorAction Ignore
+            New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+
+            $items = @(
+              "$releasePath/$assembly.deps.json",
+              "$releasePath/$assembly.dll",
+              "$releasePath/plugin.json",
+              "$releasePath/Images",
+              "$releasePath/ru-RU"
+            )
+            Copy-Item $items $tempDir -Recurse -Force
+            Compress-Archive $tempDir "$outDir/$name-$tag-$arch.zip" -Force
+          }
+
+      - name: Create release
+        if: steps.check.outputs.exists == 'false'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$env:TAG" ./out/*.zip --repo "$env:GITHUB_REPOSITORY" --target "$env:GITHUB_SHA" --title "$env:TAG" --generate-notes
