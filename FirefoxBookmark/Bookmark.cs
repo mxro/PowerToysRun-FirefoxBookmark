@@ -10,9 +10,7 @@ public class Bookmark(string title, string url)
 
 	public bool Open(string browserName) => Helper.OpenInShell(browserName, Url);
 	public bool OpenNewWindow(string browserName) => Helper.OpenInShell(browserName, $"-new-window {Url}");
-	public bool CreateNewWindow(string browserName) => Helper.OpenInShell(browserName, "-new-window");
 	public bool OpenPrivate(string browserName) => Helper.OpenInShell(browserName, $"-private-window {Url}");
-	public bool CreatePrivateWindow(string browserName) => Helper.OpenInShell(browserName, "-private-window");
 
 	public static List<Bookmark> GetBookmarks(string dbPath)
 	{

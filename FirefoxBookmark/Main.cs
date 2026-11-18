@@ -517,8 +517,7 @@ public class Main : IPlugin, IPluginI18n, IContextMenu, ISettingProvider, IReloa
 		string? processName,
 		List<IntPtr> existingWindows,
 		Guid? targetDesktopId,
-		string source,
-		Func<bool>? loadUrl = null)
+		string source)
 	{
 		if (processName is null)
 		{
@@ -552,21 +551,10 @@ public class Main : IPlugin, IPluginI18n, IContextMenu, ISettingProvider, IReloa
 
 					_ = EnsureWindowOnDesktop(virtualDesktopManager, newWindow, targetDesktopId);
 
-					if (loadUrl is not null || GetForegroundWindow() != newWindow)
+					if (GetForegroundWindow() != newWindow)
 					{
 						_ = BringToForeground(newWindow);
 						FlushActivation(newWindow);
-					}
-
-					if (loadUrl is not null)
-					{
-						// Give Firefox time to register the new window as its most recent one.
-						await Task.Delay(100).ConfigureAwait(false);
-
-						if (loadUrl())
-						{
-							ScheduleFocus(newWindow, $"{source}-load");
-						}
 					}
 
 					return;
@@ -641,23 +629,16 @@ public class Main : IPlugin, IPluginI18n, IContextMenu, ISettingProvider, IReloa
 
 		if (windowCount > 0)
 		{
-			// Firefox is running on another virtual desktop. Create an empty window on the
-			// current desktop first, then load the bookmark into that new window. Passing the
-			// URL to "-new-window" would hand it to the existing instance on the other desktop.
-			bool created = mode == OpenMode.PrivateWindow
-				? bookmark.CreatePrivateWindow(_browserName!)
-				: bookmark.CreateNewWindow(_browserName!);
+			bool opened = mode == OpenMode.PrivateWindow
+				? bookmark.OpenPrivate(_browserName!)
+				: bookmark.OpenNewWindow(_browserName!);
 
-			if (created)
+			if (opened)
 			{
-				Func<bool> loadUrl = mode == OpenMode.PrivateWindow
-					? () => bookmark.OpenPrivate(_browserName!)
-					: () => bookmark.Open(_browserName!);
-
-				ScheduleNewWindowFocus(processName, windows, currentDesktopId, "fallback-new-window", loadUrl);
+				ScheduleNewWindowFocus(processName, windows, currentDesktopId, "fallback-new-window");
 			}
 
-			return created;
+			return opened;
 		}
 
 		// No Firefox window exists yet, so let Firefox start with the bookmark directly.
