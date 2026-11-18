@@ -110,6 +110,13 @@ public class Main : IPlugin, IPluginI18n, IContextMenu, ISettingProvider, IReloa
 		int MoveWindowToDesktop(IntPtr topLevelWindow, ref Guid desktopId);
 	}
 
+	private enum OpenMode
+	{
+		CurrentWindow,
+		NewWindow,
+		PrivateWindow,
+	}
+
 	private const string BrowserPath = nameof(BrowserPath);
 	private string? _browserPath;
 	private const string BrowserName = nameof(BrowserName);
@@ -182,10 +189,7 @@ public class Main : IPlugin, IPluginI18n, IContextMenu, ISettingProvider, IReloa
 				FontFamily = "Segoe Fluent Icons,Segoe MDL2 Assets",
 				AcceleratorKey = Key.N,
 				AcceleratorModifiers = ModifierKeys.Control,
-				Action = _ => OpenWithFocus(
-					() => bookmark.OpenNewWindow(_browserName!),
-					() => bookmark.OpenNewWindow(_browserName!),
-					focusExistingAfter: false),
+				Action = _ => OpenWithFocus(bookmark, OpenMode.NewWindow),
 			},
 			new ()
 			{
@@ -194,10 +198,7 @@ public class Main : IPlugin, IPluginI18n, IContextMenu, ISettingProvider, IReloa
 				FontFamily = "Segoe Fluent Icons,Segoe MDL2 Assets",
 				AcceleratorKey = Key.P,
 				AcceleratorModifiers = ModifierKeys.Control,
-				Action = _ => OpenWithFocus(
-					() => bookmark.OpenPrivate(_browserName!),
-					() => bookmark.OpenPrivate(_browserName!),
-					focusExistingAfter: false),
+				Action = _ => OpenWithFocus(bookmark, OpenMode.PrivateWindow),
 			}
 		];
 	}
@@ -237,10 +238,7 @@ public class Main : IPlugin, IPluginI18n, IContextMenu, ISettingProvider, IReloa
 				Score = match.Score,
 				TitleHighlightData = match.MatchData,
 				ContextData = b,
-				Action = _ => OpenWithFocus(
-					() => b.Open(_browserName!),
-					() => b.OpenNewWindow(_browserName!),
-					focusExistingAfter: true),
+				Action = _ => OpenWithFocus(b, OpenMode.CurrentWindow),
 			};
 		});
 
@@ -292,6 +290,53 @@ public class Main : IPlugin, IPluginI18n, IContextMenu, ISettingProvider, IReloa
 		{
 			// Log.Warn($"FirefoxBookmark: IsWindowOnCurrentVirtualDesktop(0x{window:X}) failed: {ex.Message}", typeof(Main));
 			return true;
+		}
+	}
+
+	private static Guid? GetWindowDesktopId(IVirtualDesktopManager? virtualDesktopManager, IntPtr window)
+	{
+		if (virtualDesktopManager is null || window == IntPtr.Zero)
+		{
+			return null;
+		}
+
+		try
+		{
+			return virtualDesktopManager.GetWindowDesktopId(window, out Guid desktopId) == 0
+				? desktopId
+				: null;
+		}
+		catch (Exception)
+		{
+			return null;
+		}
+	}
+
+	private static bool EnsureWindowOnDesktop(IVirtualDesktopManager? virtualDesktopManager, IntPtr window, Guid? targetDesktopId)
+	{
+		if (virtualDesktopManager is null || targetDesktopId is null || window == IntPtr.Zero)
+		{
+			return false;
+		}
+
+		try
+		{
+			if (virtualDesktopManager.GetWindowDesktopId(window, out Guid windowDesktopId) != 0)
+			{
+				return false;
+			}
+
+			if (windowDesktopId == targetDesktopId.Value)
+			{
+				return true;
+			}
+
+			Guid target = targetDesktopId.Value;
+			return virtualDesktopManager.MoveWindowToDesktop(window, ref target) == 0;
+		}
+		catch (Exception)
+		{
+			return false;
 		}
 	}
 
@@ -468,7 +513,12 @@ public class Main : IPlugin, IPluginI18n, IContextMenu, ISettingProvider, IReloa
 		});
 	}
 
-	private static void ScheduleNewWindowFocus(string? processName, List<IntPtr> existingWindows, string source)
+	private static void ScheduleNewWindowFocus(
+		string? processName,
+		List<IntPtr> existingWindows,
+		Guid? targetDesktopId,
+		string source,
+		Func<bool>? loadUrl = null)
 	{
 		if (processName is null)
 		{
@@ -480,6 +530,7 @@ public class Main : IPlugin, IPluginI18n, IContextMenu, ISettingProvider, IReloa
 		{
 			try
 			{
+				IVirtualDesktopManager? virtualDesktopManager = CreateVirtualDesktopManager();
 				for (int attempt = 1; attempt <= 20; attempt++)
 				{
 					await Task.Delay(100).ConfigureAwait(false);
@@ -499,18 +550,23 @@ public class Main : IPlugin, IPluginI18n, IContextMenu, ISettingProvider, IReloa
 						continue;
 					}
 
-					IntPtr foreground = GetForegroundWindow();
-					if (HasWindowClass(foreground, FirefoxWindowClass))
+					_ = EnsureWindowOnDesktop(virtualDesktopManager, newWindow, targetDesktopId);
+
+					if (loadUrl is not null || GetForegroundWindow() != newWindow)
 					{
-						// Log.Info($"FirefoxBookmark: {source}: new window {DescribeWindow(newWindow)} created; Firefox already foreground: {DescribeWindow(foreground)}", typeof(Main));
-						return;
+						_ = BringToForeground(newWindow);
+						FlushActivation(newWindow);
 					}
 
-					bool activated = BringToForeground(newWindow);
-					// Log.Info($"FirefoxBookmark: {source}: new window {DescribeWindow(newWindow)} activated={activated} foreground={DescribeWindow(GetForegroundWindow())}", typeof(Main));
-					if (activated)
+					if (loadUrl is not null)
 					{
-						FlushActivation(newWindow);
+						// Give Firefox time to register the new window as its most recent one.
+						await Task.Delay(100).ConfigureAwait(false);
+
+						if (loadUrl())
+						{
+							ScheduleFocus(newWindow, $"{source}-load");
+						}
 					}
 
 					return;
@@ -525,10 +581,13 @@ public class Main : IPlugin, IPluginI18n, IContextMenu, ISettingProvider, IReloa
 		});
 	}
 
-	private bool OpenWithFocus(Func<bool> openExisting, Func<bool> openNewWindow, bool focusExistingAfter)
+	private bool OpenWithFocus(Bookmark bookmark, OpenMode mode)
 	{
 		// Grant foreground rights while PowerToys Run is still the foreground process.
 		_ = AllowSetForegroundWindow(ASFW_ANY);
+
+		IVirtualDesktopManager? virtualDesktopManager = CreateVirtualDesktopManager();
+		Guid? currentDesktopId = GetWindowDesktopId(virtualDesktopManager, GetForegroundWindow());
 
 		string? processName = ResolveProcessName(_browserName);
 		List<IntPtr> windows = processName is null ? new List<IntPtr>() : GetFirefoxWindows(processName);
@@ -537,7 +596,6 @@ public class Main : IPlugin, IPluginI18n, IContextMenu, ISettingProvider, IReloa
 
 		if (processName is not null && windowCount > 0)
 		{
-			IVirtualDesktopManager? virtualDesktopManager = CreateVirtualDesktopManager();
 			foreach (IntPtr window in windows)
 			{
 				if (IsOnCurrentDesktop(virtualDesktopManager, window))
@@ -559,42 +617,57 @@ public class Main : IPlugin, IPluginI18n, IContextMenu, ISettingProvider, IReloa
 			// Give Firefox time to register the activated window as its most recent one before the URL arrives.
 			Thread.Sleep(100);
 
-			bool opened = focusExistingAfter ? openExisting() : openNewWindow();
+			bool opened = mode switch
+			{
+				OpenMode.NewWindow => bookmark.OpenNewWindow(_browserName!),
+				OpenMode.PrivateWindow => bookmark.OpenPrivate(_browserName!),
+				_ => bookmark.Open(_browserName!),
+			};
+
 			if (opened)
 			{
-				if (focusExistingAfter)
+				if (mode == OpenMode.CurrentWindow)
 				{
 					ScheduleFocus(anchor, "tab");
 				}
 				else
 				{
-					ScheduleNewWindowFocus(processName, windows, "new-window");
+					ScheduleNewWindowFocus(processName, windows, currentDesktopId, "new-window");
 				}
 			}
 
 			return opened;
 		}
 
-		bool useNewWindow = windowCount > 0;
-		// Log.Info(
-		//     $"FirefoxBookmark: no current-desktop Firefox window, totalWindows={windowCount}, useNewWindow={useNewWindow}",
-		//     typeof(Main));
-
-		if (useNewWindow)
+		if (windowCount > 0)
 		{
-			bool opened = openNewWindow();
-			if (opened)
+			// Firefox is running on another virtual desktop. Create an empty window on the
+			// current desktop first, then load the bookmark into that new window. Passing the
+			// URL to "-new-window" would hand it to the existing instance on the other desktop.
+			bool created = mode == OpenMode.PrivateWindow
+				? bookmark.CreatePrivateWindow(_browserName!)
+				: bookmark.CreateNewWindow(_browserName!);
+
+			if (created)
 			{
-				ScheduleNewWindowFocus(processName, windows, "fallback-new-window");
+				Func<bool> loadUrl = mode == OpenMode.PrivateWindow
+					? () => bookmark.OpenPrivate(_browserName!)
+					: () => bookmark.Open(_browserName!);
+
+				ScheduleNewWindowFocus(processName, windows, currentDesktopId, "fallback-new-window", loadUrl);
 			}
 
-			return opened;
+			return created;
 		}
 
-		bool coldStarted = openExisting();
+		// No Firefox window exists yet, so let Firefox start with the bookmark directly.
+		bool coldStarted = mode == OpenMode.PrivateWindow
+			? bookmark.OpenPrivate(_browserName!)
+			: bookmark.Open(_browserName!);
+
 		if (coldStarted)
 		{
-			ScheduleNewWindowFocus(processName, windows, "cold-start");
+			ScheduleNewWindowFocus(processName, windows, currentDesktopId, "cold-start");
 		}
 
 		return coldStarted;
